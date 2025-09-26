@@ -1,4 +1,5 @@
 import logging
+import re
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -23,19 +24,94 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 
+def clean_llm_output(text: str) -> str:
+    """
+    清理 LLM 输出文本，去除 <think></think> 标签和标点符号
+    只保留单词用于 TTS 合成
+    """
+    if not text:
+        return ""
+    
+    # 去除 <think></think> 标签及其内容
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # 去除所有标点符号，只保留字母、数字和空格
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # 去除多余的空格
+    text = ' '.join(text.split())
+    
+    return text.strip()
+
+
+def is_chinese_text(text: str) -> bool:
+    """
+    检测文本是否包含中文字符
+    """
+    chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
+    return bool(chinese_pattern.search(text))
+
+
 class AITranslatorAssistant(Agent):
     """AI 中译英翻译助手类"""
     
     def __init__(self) -> None:
         super().__init__(
-            # 设置 AI 助手的基本指令：专门负责中文到英文的翻译
-            instructions="""你现在是一个优秀的AI中译英翻译，你的职责是当用户说出的是中文的内容时，你将对应对的中文内容翻译成英文""",
-        )
+            # 设置 AI 助手的基本指令：专门负责中文到英文的实时语音翻译
+            instructions="""You are a Chinese-to-English translation assistant. Your ONLY job is to translate Chinese input into English.
 
+CRITICAL RULES:
+1. You MUST ALWAYS respond in English, never in Chinese
+2. When user speaks Chinese, translate it to English immediately
+3. Do NOT repeat the Chinese text
+4. Do NOT add explanations or prefixes like "The translation is" or "In English"
+5. Output ONLY the English translation
+6. Do NOT use any tags like <think></think>
+7. Keep responses concise and natural
+
+Examples:
+User: "你好，很高兴见到你" 
+You: "Hello nice to meet you"
+
+User: "今天天气真不错"
+You: "The weather is really nice today"
+
+User: "我想喝水"
+You: "I want to drink water"
+
+REMEMBER: Always respond in English only. Never output Chinese characters.""",
+        )
+    
+    async def say(self, message: str, **kwargs) -> None:
+        """重写 say 方法，在发送到 TTS 前清理文本并检查语言"""
+        # 记录原始 LLM 输出
+        logger.info(f"LLM 原始输出: '{message}'")
+        
+        # 检查是否包含中文字符
+        if is_chinese_text(message):
+            logger.error(f"警告：LLM 输出包含中文字符，应该是英文翻译！原文: '{message}'")
+            # 强制使用英文默认响应
+            cleaned_message = "I apologize but I need to translate that to English"
+        else:
+            # 清理文本：去除 <think></think> 标签和标点符号
+            cleaned_message = clean_llm_output(message)
+            
+            # 如果清理后的文本为空，使用默认响应
+            if not cleaned_message:
+                cleaned_message = "Sorry I could not translate that"
+                logger.warning("清理后文本为空，使用默认响应")
+        
+        # 记录清理后的文本
+        logger.info(f"清理后的文本: '{cleaned_message}'")
+        
+        # 调用父类的 say 方法发送清理后的文本到 TTS
+        await super().say(cleaned_message, **kwargs)
+    
     async def on_enter(self) -> None:
-        """当用户进入房间时的欢迎消息"""
-        await self.session.generate_reply(
-            instructions="用中文的方式，告诉用户你是优秀的中译英翻译，你可以帮助他将他说的中文内容翻译成英文")
+        """当用户进入房间时的英文欢迎消息"""
+        await self.say("Hello I am your Chinese to English translation assistant Please speak in Chinese and I will translate it to English for you")
+
+
 
 def prewarm(proc: JobProcess):
     """预热函数：在 Agent 启动前预加载模型以提高响应速度"""
@@ -87,6 +163,27 @@ async def entrypoint(ctx: JobContext):
     @session.on("user_transcript_received")
     def _on_user_transcript_received(ev):
         logger.info(f"用户说话内容: {ev.transcript}")
+
+    # 记录 LLM 生成的翻译结果
+    @session.on("agent_speech_committed")
+    def _on_agent_speech_committed(ev):
+        logger.info(f"LLM 翻译输出: {ev.agent_transcript}")
+
+    # 记录 LLM 实时生成的内容（可能包含部分生成结果）
+    @session.on("agent_transcript_received")
+    def _on_agent_transcript_received(ev):
+        cleaned_text = clean_llm_output(ev.transcript)
+        logger.info(f"LLM 实时输出: '{ev.transcript}' -> 清理后: '{cleaned_text}' (原长度: {len(ev.transcript)}, 清理后长度: {len(cleaned_text)})")
+
+    # 监听 LLM 开始生成响应的事件
+    @session.on("agent_started_speaking")
+    def _on_agent_started_speaking(ev):
+        logger.info("Agent 开始生成语音响应")
+
+    # 监听 LLM 停止生成响应的事件
+    @session.on("agent_stopped_speaking")
+    def _on_agent_stopped_speaking(ev):
+        logger.info("Agent 停止生成语音响应")
 
     # 处理误判中断：有时背景噪音可能会误触发中断，这些被认为是假阳性中断
     # 当检测到误判时，恢复 Agent 的语音输出
