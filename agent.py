@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import re
 
 from dotenv import load_dotenv
@@ -16,6 +17,7 @@ from livekit.agents import (
     metrics, )
 from livekit.plugins import cartesia, noise_cancellation, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from requests import session
 
 # 创建日志记录器
 logger = logging.getLogger("agent")
@@ -31,16 +33,16 @@ def clean_llm_output(text: str) -> str:
     """
     if not text:
         return ""
-    
+
     # 去除 <think></think> 标签及其内容
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    
+
     # 去除所有标点符号，只保留字母、数字和空格
     text = re.sub(r'[^\w\s]', '', text)
-    
+
     # 去除多余的空格
     text = ' '.join(text.split())
-    
+
     return text.strip()
 
 
@@ -54,7 +56,7 @@ def is_chinese_text(text: str) -> bool:
 
 class AITranslatorAssistant(Agent):
     """AI 中译英翻译助手类"""
-    
+
     def __init__(self) -> None:
         super().__init__(
             # 设置 AI 助手的基本指令：专门负责中文到英文的实时语音翻译
@@ -81,12 +83,12 @@ You: "I want to drink water"
 
 REMEMBER: Always respond in English only. Never output Chinese characters.""",
         )
-    
+
     async def say(self, message: str, **kwargs) -> None:
         """重写 say 方法，在发送到 TTS 前清理文本并检查语言"""
         # 记录原始 LLM 输出
         logger.info(f"LLM 原始输出: '{message}'")
-        
+
         # 检查是否包含中文字符
         if is_chinese_text(message):
             logger.error(f"警告：LLM 输出包含中文字符，应该是英文翻译！原文: '{message}'")
@@ -95,22 +97,25 @@ REMEMBER: Always respond in English only. Never output Chinese characters.""",
         else:
             # 清理文本：去除 <think></think> 标签和标点符号
             cleaned_message = clean_llm_output(message)
-            
+
             # 如果清理后的文本为空，使用默认响应
             if not cleaned_message:
                 cleaned_message = "Sorry I could not translate that"
                 logger.warning("清理后文本为空，使用默认响应")
-        
+
         # 记录清理后的文本
         logger.info(f"清理后的文本: '{cleaned_message}'")
-        
+
         # 调用父类的 say 方法发送清理后的文本到 TTS
-        await super().say(cleaned_message, **kwargs)
-    
+        await session.say(cleaned_message, **kwargs)
+
     async def on_enter(self) -> None:
         """当用户进入房间时的英文欢迎消息"""
-        await self.say("Hello I am your Chinese to English translation assistant Please speak in Chinese and I will translate it to English for you")
-
+        # 一些 TTS 提供方在会话刚启动时尚未完全就绪，这里轻微等待以避免竞态
+        try:
+            await asyncio.sleep(0.5)
+        except Exception:
+            logger.exception("欢迎语播报失败：on_enter 阶段调用 say 出错，已跳过")
 
 
 def prewarm(proc: JobProcess):
@@ -173,7 +178,8 @@ async def entrypoint(ctx: JobContext):
     @session.on("agent_transcript_received")
     def _on_agent_transcript_received(ev):
         cleaned_text = clean_llm_output(ev.transcript)
-        logger.info(f"LLM 实时输出: '{ev.transcript}' -> 清理后: '{cleaned_text}' (原长度: {len(ev.transcript)}, 清理后长度: {len(cleaned_text)})")
+        logger.info(
+            f"LLM 实时输出: '{ev.transcript}' -> 清理后: '{cleaned_text}' (原长度: {len(ev.transcript)}, 清理后长度: {len(cleaned_text)})")
 
     # 监听 LLM 开始生成响应的事件
     @session.on("agent_started_speaking")
@@ -230,6 +236,7 @@ async def entrypoint(ctx: JobContext):
         ),
     )
 
+    session.say("你好，我是你的AI翻译助手，请说中文，我会帮你翻译成英文", allow_interruptions=False)
     # 加入房间并连接到用户
     await ctx.connect()
 
